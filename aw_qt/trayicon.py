@@ -6,7 +6,7 @@ import sys
 import time
 import webbrowser
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 import aw_core
 from PyQt6 import QtCore
@@ -73,8 +73,11 @@ def open_dir(d: str) -> None:
 
 
 class TrayIcon(QSystemTrayIcon):
-    MAX_AUTO_RESTARTS = 3
-    RESTART_WINDOW_SECONDS = 600  # 10 minutes
+    # 放宽限制，避免断网/临时不可达（如 NAS）时过快放弃；aw-sync 等依赖网络的模块会因连接断开退出
+    MAX_AUTO_RESTARTS = 8
+    RESTART_WINDOW_SECONDS = 1800  # 30 分钟
+    # 自动重启前等待秒数，避免进程反复退出时紧挨着重启
+    AUTO_RESTART_DELAY_MS = 15000  # 15 秒
 
     def __init__(
         self,
@@ -91,6 +94,8 @@ class TrayIcon(QSystemTrayIcon):
         self.manager = manager
         self.testing = testing
         self._restart_timestamps: Dict[str, List[float]] = {}
+        # 已安排延迟重启的模块名，避免同一次退出被多次安排重启
+        self._pending_restart: Set[str] = set()
 
         if port is None:
             port = 5666 if testing else 5600
@@ -199,21 +204,32 @@ class TrayIcon(QSystemTrayIcon):
         def check_module_status() -> None:
             unexpected_exits = self.manager.get_unexpected_stops()
             for module in unexpected_exits:
+                if module.name in self._pending_restart:
+                    continue
                 recent = self._recent_restart_count(module.name)
                 if recent < self.MAX_AUTO_RESTARTS:
                     logger.info(
-                        f"Auto-restarting crashed module {module.name} "
+                        f"Auto-restarting module {module.name} in "
+                        f"{self.AUTO_RESTART_DELAY_MS // 1000}s "
                         f"(attempt {recent + 1}/{self.MAX_AUTO_RESTARTS}"
                         f" in {self.RESTART_WINDOW_SECONDS // 60}min window)"
                     )
                     module.stop()  # Clean up state
-                    module.start(self.testing)
-                    self._record_restart(module.name)
-                    self.showMessage(
-                        "ActivityWatch",
-                        f"Module {module.name} crashed and was auto-restarted",
-                        QSystemTrayIcon.MessageIcon.Warning,
-                        5000,
+                    self._pending_restart.add(module.name)
+
+                    def do_restart(m: Module = module) -> None:
+                        self._pending_restart.discard(m.name)
+                        m.start(self.testing)
+                        self._record_restart(m.name)
+                        self.showMessage(
+                            "ActivityWatch",
+                            f"Module {m.name} was restarted",
+                            QSystemTrayIcon.MessageIcon.Information,
+                            4000,
+                        )
+
+                    QtCore.QTimer.singleShot(
+                        self.AUTO_RESTART_DELAY_MS, do_restart
                     )
                 else:
                     logger.warning(
